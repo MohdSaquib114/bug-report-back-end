@@ -1,7 +1,11 @@
+import json
+
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile, status
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.deps import get_current_user, get_optional_user
+from app.errors import ValidationFailure
 from app.models.bugs import Bug, BugPriority, StatusEnum
 from app.models.comments import Comment
 from app.models.users import User
@@ -19,31 +23,114 @@ from config.database import get_db
 
 router = APIRouter(tags=["bugs"])
 
+MAX_SCREENSHOTS = 3
+MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
+
 
 @router.post(
     "/projects/{slug}/bugs",
     response_model=BugOut,
     status_code=status.HTTP_201_CREATED,
 )
-def report_bug(
+async def report_bug(
     slug: str,
-    data: BugReportData,
     request: Request,
     db: Session = Depends(get_db),
     user: User | None = Depends(get_optional_user),
 ) -> Bug:
     """Public endpoint used by the embeddable widget.
 
-    The widget POSTs the full ``BugReportData`` body (title, description,
-    up to 3 screenshots, timestamp and metadata) to ``/projects/{slug}/bugs``.
+    Accepts either:
+
+    * ``application/json`` — the full ``BugReportData`` body with base64
+      ``data:`` URL screenshots (kept for backwards compatibility), or
+    * ``multipart/form-data`` — ``title``, ``description``, optional
+      ``timestamp``/``meta`` and up to 3 ``screenshots`` image files.
+
     Auth is optional; when a bearer token is present the report is attributed
     to that user.
     """
     ip_address = request.client.host if request.client else None
-    return BugService(db).report(
+    service = BugService(db)
+    reporter_id = user.id if user else None
+    content_type = request.headers.get("content-type", "")
+
+    if content_type.startswith("multipart/form-data"):
+        return await _report_multipart(
+            service,
+            slug,
+            request,
+            reporter_id=reporter_id,
+            ip_address=ip_address,
+        )
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise ValidationFailure("Request body must be valid JSON") from exc
+    try:
+        data = BugReportData.model_validate(payload)
+    except ValidationError as exc:
+        raise ValidationFailure("Invalid bug report payload") from exc
+
+    return service.report(
         slug,
         data,
-        reporter_id=user.id if user else None,
+        reporter_id=reporter_id,
+        ip_address=ip_address,
+    )
+
+
+async def _report_multipart(
+    service: BugService,
+    slug: str,
+    request: Request,
+    *,
+    reporter_id: int | None,
+    ip_address: str | None,
+) -> Bug:
+    form = await request.form()
+
+    title = str(form.get("title") or "").strip()
+    description = str(form.get("description") or "").strip()
+    if not title:
+        raise ValidationFailure("Title is required")
+    if not description:
+        raise ValidationFailure("Description is required")
+
+    location = None
+    meta_raw = form.get("meta")
+    if meta_raw:
+        try:
+            location = json.loads(str(meta_raw)).get("url")
+        except (AttributeError, TypeError, ValueError):
+            location = None
+
+    files = [value for value in form.getlist("screenshots") if hasattr(value, "read")]
+    if len(files) > MAX_SCREENSHOTS:
+        raise ValidationFailure(
+            "At most {0} screenshots are allowed".format(MAX_SCREENSHOTS)
+        )
+
+    screenshots: list[tuple[str | None, str, bytes]] = []
+    for item in files:
+        content_type = (item.content_type or "").lower()
+        if not content_type.startswith("image/"):
+            raise ValidationFailure("Screenshots must be image files")
+        data = await item.read()
+        if not data:
+            continue
+        if len(data) > MAX_SCREENSHOT_BYTES:
+            raise ValidationFailure("A screenshot exceeds the 8 MB limit")
+        screenshots.append((item.filename, content_type, data))
+
+    return service.report_multipart(
+        slug,
+        title=title,
+        description=description,
+        screenshots=screenshots,
+        location=location,
+        reporter_id=reporter_id,
         ip_address=ip_address,
     )
 

@@ -1,12 +1,24 @@
+import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.errors import AppError
 from app.repositories.permission_repository import PermissionRepository
 from app.routers import bugs, projects, users
 from config.database import session
+
+load_dotenv()
+
+
+def _allowed_origins() -> list[str]:
+    # Comma-separated list in CORS_ORIGINS. Defaults to "*" (any origin).
+    raw = os.getenv("CORS_ORIGINS", "*")
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return origins or ["*"]
 
 
 @asynccontextmanager
@@ -26,6 +38,14 @@ app = FastAPI(
     title="BugDrop API",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

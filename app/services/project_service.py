@@ -24,8 +24,8 @@ class ProjectService:
         self.users = UserRepository(db)
         self.permissions = PermissionService(db)
 
-    def _unique_slug(self, name: str, desired: str | None = None) -> str:
-        base = slugify(desired or name)
+    def _unique_slug(self, name: str) -> str:
+        base = slugify(name)
         if not self.projects.slug_exists(base):
             return base
         while True:
@@ -36,7 +36,7 @@ class ProjectService:
     def create(self, user: User, data: ProjectCreate) -> Project:
         project = self.projects.create(
             name=data.name,
-            slug=self._unique_slug(data.name, data.slug),
+            slug=self._unique_slug(data.name),
             description=data.description,
             owner_id=user.id,
         )
@@ -85,13 +85,6 @@ class ProjectService:
     def update(self, slug: str, data: ProjectUpdate, user: User) -> Project:
         project = self._get_for_manage(slug, user)
         fields = data.model_dump(exclude_unset=True)
-
-        new_slug = fields.get("slug")
-        if new_slug and new_slug != project.slug:
-            if self.projects.slug_exists(new_slug):
-                raise ConflictError("That slug is already taken")
-            fields["slug"] = slugify(new_slug)
-
         project = self.projects.update(project, **fields)
         self.db.commit()
         self.db.refresh(project)

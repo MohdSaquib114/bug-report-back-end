@@ -80,6 +80,48 @@ class BugService:
         self.db.refresh(bug)
         return bug
 
+    def report_multipart(
+        self,
+        slug: str,
+        *,
+        title: str,
+        description: str,
+        screenshots: list[tuple[str | None, str, bytes]],
+        location: str | None = None,
+        reporter_id: int | None = None,
+        ip_address: str | None = None,
+    ) -> Bug:
+        """Create a widget report from already-decoded multipart image files.
+
+        ``screenshots`` items are ``(filename, content_type, data)`` tuples.
+        Files are handed to the storage service instead of being carried as
+        base64 strings inside a JSON body.
+        """
+        project = self.projects.get_by_slug(slug, include_archived=False)
+        if project is None:
+            raise NotFoundError("Project not found")
+
+        bug = self.bugs.create(
+            title=title,
+            description=description,
+            project_id=project.id,
+            reporter_id=reporter_id,
+            ip_address=ip_address,
+            location=location,
+        )
+        for filename, content_type, data in screenshots:
+            self._store_attachment(
+                bug=bug,
+                filename=filename or "screenshot-{0}.jpg".format(bug.id),
+                source_bytes=data,
+                content_type=content_type,
+                uploaded_by_id=reporter_id,
+            )
+        self._log(bug, None, ActivityType.CREATED, new_value=bug.status.value)
+        self.db.commit()
+        self.db.refresh(bug)
+        return bug
+
     # ------------------------------------------------------------------
     # Private bug management
     # ------------------------------------------------------------------
@@ -312,10 +354,18 @@ class BugService:
             url, key, size = stored.url, stored.key, len(raw)
         elif require_storage:
             raise StorageError("Attachment storage is not configured")
+        elif data_url:
+            # Fall back to the inline data URL when no bucket is set.
+            url = data_url
+            size = len(raw) if raw is not None else len(data_url)
+        elif raw is not None:
+            # Multipart uploads have no data URL, so build one for the fallback.
+            encoded = base64.b64encode(raw).decode("ascii")
+            url = "data:{0};base64,{1}".format(content_type, encoded)
+            size = len(raw)
         else:
-            # Fall back to storing the inline data URL when no bucket is set.
-            url = data_url or ""
-            size = len(raw) if raw is not None else (len(data_url) if data_url else None)
+            url = ""
+            size = None
 
         return self.attachments.create(
             bug_id=bug.id,
